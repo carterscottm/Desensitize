@@ -14,11 +14,13 @@ namespace Desensitize
     /// pixel radius is range divided by map scale.  Zoomed in far enough, that radius reaches
     /// millions of pixels.  GDI+ then has to build and dash a path that is mostly off screen,
     /// which is extremely slow and can exhaust memory.  This patch intercepts those draw calls
-    /// and either skips rings that cannot be seen or draws only the visible part of the arc.
+    /// and only lets a ring through when at least one pixel of it is in the viewport and its
+    /// center is on screen or just outside the viewport.  Anything else is skipped.
     /// </summary>
     public class Desensitize : AuroraPatch.Patch
     {
         public override string Description => "Prevents slowdowns and crashes from huge dashed range rings when zoomed in";
+
         public override IEnumerable<string> Dependencies => new string[0];
 
         protected override void Loaded(Harmony harmony)
@@ -40,7 +42,7 @@ namespace Desensitize
                 prefix.priority = Priority.Last;
 
                 harmony.Patch(drawEllipse, prefix: prefix);
-                LogInfo("Desensitize: range ring clipping enabled");
+                LogInfo("Desensitize: range ring culling enabled");
             }
             catch (Exception e)
             {
@@ -51,13 +53,14 @@ namespace Desensitize
 
     internal static class RingClipper
     {
-        // Rings with a radius at or below this are drawn normally.  Larger rings are
-        // clipped to the visible area.  Lower this if the map is still slow, raise it if
-        // you see dash patterns change as you zoom.
-        private const double ClipRadius = 1500.0;
+        // How far outside the viewport a ring center may sit and still be drawn, as a fraction
+        // of the viewport's longest edge.  At 0.05 a 1920x1200 viewport allows a center up to
+        // 96 px outside any edge.  Raise it to keep more off-screen-center rings on the map.
+        private const double CenterMarginFraction = 0.05;
 
         // Argument names are positional (__0 to __4) so they do not depend on the parameter
         // names used by the System.Drawing implementation in use.
+        // Returning true runs the original DrawEllipse.  Returning false suppresses it.
         private static bool Prefix(Graphics __instance, Pen __0, float __1, float __2, float __3, float __4)
         {
             Pen pen = __0;
@@ -71,7 +74,8 @@ namespace Desensitize
                 return true;
 
             // A non-finite ring cannot be drawn meaningfully and can destabilize GDI+.
-            if (float.IsNaN(x) || float.IsInfinity(x) || float.IsNaN(width) || float.IsInfinity(width))
+            if (float.IsNaN(x) || float.IsInfinity(x) || float.IsNaN(y) || float.IsInfinity(y) ||
+                float.IsNaN(width) || float.IsInfinity(width))
                 return false;
 
             // Only circles are handled here.
@@ -80,65 +84,47 @@ namespace Desensitize
 
             try
             {
-                // Handle returns true when it drew or skipped the ring, so suppress the original.
-                return !Handle(__instance, pen, x, y, width);
+                return ShouldDraw(__instance, pen, x, y, width);
             }
             catch
             {
+                // If the check itself fails, fall back to the game's normal behavior.
                 return true;
             }
         }
 
-        // Returns true if the ring was skipped or drawn here.  Returns false to let GDI+ draw it.
-        private static bool Handle(Graphics g, Pen pen, double x, double y, double d)
+        // A ring is drawn only if both of these hold:
+        //   1. At least one pixel of the ring is inside the viewport.
+        //   2. The ring center is inside the viewport, or within CenterMarginFraction of the
+        //      longest viewport edge outside of it.
+        //
+        // Condition 2 is what keeps GDI+ safe.  With the center that close to the viewport and
+        // some part of the ring inside it, the radius cannot exceed roughly the viewport
+        // diagonal plus the margin, so GDI+ never has to build a huge path.
+        private static bool ShouldDraw(Graphics g, Pen pen, double x, double y, double d)
         {
             double r = d / 2, cx = x + r, cy = y + r;
 
             RectangleF v = g.VisibleClipBounds;
-            v.Inflate(50f, 50f);
 
-            // Distance from the ring center to the nearest and farthest point of the visible area.
+            // Center must be in the viewport or within the allowed margin around it.
+            double m = Math.Max(v.Width, v.Height) * CenterMarginFraction;
+            if (cx < v.Left - m || cx > v.Right + m || cy < v.Top - m || cy > v.Bottom + m)
+                return false;
+
+            // Distance from the center to the nearest and farthest point of the viewport.
             double nx = Math.Max(v.Left, Math.Min(cx, v.Right));
             double ny = Math.Max(v.Top, Math.Min(cy, v.Bottom));
             double dMin = Math.Sqrt((cx - nx) * (cx - nx) + (cy - ny) * (cy - ny));
 
-            double[] px = { v.Left, v.Right, v.Right, v.Left };
-            double[] py = { v.Top, v.Top, v.Bottom, v.Bottom };
-            double dMax = 0;
-            for (int i = 0; i < 4; i++)
-                dMax = Math.Max(dMax, Math.Sqrt((cx - px[i]) * (cx - px[i]) + (cy - py[i]) * (cy - py[i])));
+            double fx = Math.Max(cx - v.Left, v.Right - cx);
+            double fy = Math.Max(cy - v.Top, v.Bottom - cy);
+            double dMax = Math.Sqrt(fx * fx + fy * fy);
 
-            // The ring only touches the visible area when dMin <= r <= dMax.
-            if (r < dMin || r > dMax)
-                return true;
-
-            // Small enough that GDI+ handles it fine.
-            if (r <= ClipRadius)
-                return false;
-
-            // Angular span of the visible area as seen from the ring center.
-            double a0 = Math.Atan2((v.Top + v.Bottom) / 2 - cy, (v.Left + v.Right) / 2 - cx);
-            double lo = 0, hi = 0;
-            for (int i = 0; i < 4; i++)
-            {
-                double da = Math.Atan2(py[i] - cy, px[i] - cx) - a0;
-                while (da > Math.PI) da -= 2 * Math.PI;
-                while (da < -Math.PI) da += 2 * Math.PI;
-                lo = Math.Min(lo, da);
-                hi = Math.Max(hi, da);
-            }
-
-            // Draw only the visible arc as a short polyline.
-            const int steps = 96;
-            var pts = new PointF[steps + 1];
-            for (int i = 0; i <= steps; i++)
-            {
-                double a = a0 + lo + (hi - lo) * i / steps;
-                pts[i] = new PointF((float)(cx + r * Math.Cos(a)), (float)(cy + r * Math.Sin(a)));
-            }
-
-            g.DrawLines(pen, pts);
-            return true;
+            // The ring touches the viewport when dMin <= r <= dMax.  Half the pen width is added
+            // on each side so a stroke that only just reaches the viewport still counts.
+            double hw = pen.Width / 2.0;
+            return r >= dMin - hw && r <= dMax + hw;
         }
     }
 }
